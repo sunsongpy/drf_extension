@@ -1,86 +1,47 @@
-from rest_framework import serializers
+from rest_framework.utils import model_meta
 
 
-class DynamicModelFieldsSerializer(serializers.ModelSerializer):
+def _get_fields_from_query_params(fields):
+    fs = set()
+    for f in fields.split(','):
+        f = f.strip()
+        if '.' in f:
+            fs.add(f.split('.')[0])
+        else:
+            fs.add(f)
+    return fs
 
-    def __init_subclass__(cls, **kwargs):
-        meta = cls.Meta
-        if not hasattr(meta, 'fields'):
-            meta.fields = serializers.ALL_FIELDS
-        if getattr(meta, 'depth', None) is None:
-            meta.depth = 10
-        return super().__init_subclass__()
 
-    @staticmethod
-    def get_exact_fields(extra_fields, depth, prefix, flag=True):
-        exact_fields = set()
-        for field in extra_fields:
-            field = field.strip()
-            if not field:
-                continue
+class DynamicFieldViewMix:
 
-            if depth:
-                if field == prefix:
-                    exact_fields.clear()
-                    exact_fields.add('id')
-                    break
-                else:
-                    fields = field.split('.', depth)
-                    if len(fields) >= depth and prefix == fields[depth - 1]:
-                        if len(fields) == depth:
-                            exact_fields.add('id')
-                        else:
-                            new_fields = fields[depth].split('.')[0]
-                            if new_fields == '*':
-                                exact_fields.clear()
-                                break
-                            else:
-                                exact_fields.add(new_fields)
-            else:
-                if '.' in field:
-                    if flag:
-                        exact_fields.add(field.split('.')[0])
-                else:
-                    exact_fields.add(field)
-        return exact_fields
+    def get_queryset(self):
+        select_relate_fields = self.get_select_related_field()
+        queryset = super().get_queryset()
+        if select_relate_fields:
+            queryset = queryset.select_related(*select_relate_fields).all()
+        return queryset
 
-    def get_include_fields(self, request, depth, prefix):
-        include_fields = request.query_params.get('include', '').split(',')
-        return self.get_exact_fields(include_fields, depth, prefix)
+    def get_select_related_field(self):
+        queryset = getattr(self, 'queryset', None)
+        request = getattr(self, 'request', None)
+        if queryset is None or request is None:
+            return
 
-    def get_exclude_fields(self, request, depth, prefix):
-        exclude_fields = request.query_params.get('exclude', '').split(',')
-        return self.get_exact_fields(exclude_fields, depth, prefix, flag=False)
+        model = queryset.model
+        select_related_fields = []
+        forward_relation_fields = model_meta.get_field_info(model).forward_relations.keys()
 
-    def get_field_names(self, declared_fields, info):
-        request = self.context.get('request')
-        fields = super().get_field_names(declared_fields, info)
-        if request.method != 'GET' or request is None:
-            return fields
+        include_fields = request.query_params.get('include', '')
+        exclude_fields = request.query_params.get('exclude', '')
+        include_fields = _get_fields_from_query_params(include_fields)
+        exclude_fields = _get_fields_from_query_params(exclude_fields)
 
-        view = self.context['view']
-        root_depth = view.serializer_class.Meta.depth
-        depth = root_depth - self.Meta.depth
-        prefix = getattr(self.Meta, 'prefix', '')
+        for i in include_fields:
+            if i in forward_relation_fields:
+                select_related_fields.append(i)
 
-        include = self.get_include_fields(request, depth, prefix)
-        exclude = self.get_exclude_fields(request, depth, prefix)
+        for j in exclude_fields:
+            if j in forward_relation_fields:
+                select_related_fields.remove(j)
 
-        if include:
-            fields = set(fields) & include
-        if exclude:
-            fields = set(fields) ^ exclude
-
-        return list(fields)
-
-    def build_nested_field(self, field_name, relation_info, nested_depth):
-        _, field_kwargs = super().build_nested_field(field_name, relation_info, nested_depth)
-
-        class NestedSerializer(self.__class__):
-            class Meta:
-                model = relation_info.related_model
-                depth = nested_depth - 1
-                fields = '__all__'
-                prefix = field_name
-        field_class = NestedSerializer
-        return field_class, field_kwargs
+        return select_related_fields
