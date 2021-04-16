@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 
-class DynamicModelFieldsSerializer(serializers.ModelSerializer):
+class DynamicFieldsModelSerializer(serializers.ModelSerializer):
 
     def __init_subclass__(cls, **kwargs):
         meta = cls.Meta
