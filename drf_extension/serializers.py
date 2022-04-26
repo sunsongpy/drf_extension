@@ -1,86 +1,88 @@
+from collections import defaultdict
+
+from django.db import models
+from django.utils.functional import cached_property
 from rest_framework import serializers
+from rest_framework.utils.field_mapping import get_nested_relation_kwargs
 
 
-class DynamicFieldsModelSerializer(serializers.ModelSerializer):
+def mapping_depth_fields(fields, depth):
+    ret = defaultdict(list)
+    if not fields or depth is None:
+        return ret
+    fields = fields.split(',')
+    left = []
+    for f in fields:
+        v = f.split('.', 1)
+        if len(v) == 1:
+            ret[depth].append(v[0])
+        else:
+            if v[0] not in ret[depth]:
+                ret[depth].append(v[0])
+            left.append(v[1])
+    ret.update(mapping_depth_fields(','.join(left), depth-1))
+    return ret
 
-    def __init_subclass__(cls, **kwargs):
-        meta = cls.Meta
-        if not hasattr(meta, 'fields'):
-            meta.fields = serializers.ALL_FIELDS
-        if getattr(meta, 'depth', None) is None:
-            meta.depth = 10
-        return super().__init_subclass__()
 
-    @staticmethod
-    def get_exact_fields(extra_fields, depth, prefix, flag=True):
-        exact_fields = set()
-        for field in extra_fields:
-            field = field.strip()
-            if not field:
-                continue
+class ListModelDynamicFieldSerializer(serializers.ListSerializer):
 
-            if depth:
-                if field == prefix:
-                    exact_fields.clear()
-                    exact_fields.add('id')
-                    break
-                else:
-                    fields = field.split('.', depth)
-                    if len(fields) >= depth and prefix == fields[depth - 1]:
-                        if len(fields) == depth:
-                            exact_fields.add('id')
-                        else:
-                            new_fields = fields[depth].split('.')[0]
-                            if new_fields == '*':
-                                exact_fields.clear()
-                                break
-                            else:
-                                exact_fields.add(new_fields)
-            else:
-                if '.' in field:
-                    if flag:
-                        exact_fields.add(field.split('.')[0])
-                else:
-                    exact_fields.add(field)
-        return exact_fields
+    def update(self, instance, validated_data):
+        super().update(instance, validated_data)
 
-    def get_include_fields(self, request, depth, prefix):
-        include_fields = request.query_params.get('include', '').split(',')
-        return self.get_exact_fields(include_fields, depth, prefix)
+    def to_representation(self, data):
+        child = self.child
+        include_fields = [f for f, c in child.fields.items() if not c.write_only]
+        origin_fields = getattr(child, '_origin_fields')
+        defer_fields = set(origin_fields) - set(include_fields)
 
-    def get_exclude_fields(self, request, depth, prefix):
-        exclude_fields = request.query_params.get('exclude', '').split(',')
-        return self.get_exact_fields(exclude_fields, depth, prefix, flag=False)
+        if isinstance(data, models.Manager):
+            try:
+                defer_fields.remove(data.field.name)
+            except (AttributeError, KeyError):
+                pass
+
+        iterable = data.all() if isinstance(data, models.Manager) else data
+        if defer_fields and isinstance(iterable, models.QuerySet):
+            iterable = iterable.defer(*defer_fields)
+
+        return [
+            child.to_representation(item) for item in iterable
+        ]
+
+
+class ModelDynamicFieldSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        list_serializer_class = ListModelDynamicFieldSerializer
+
+    @cached_property
+    def fields_from_request(self):
+
+        context = self.context
+        include_fields = context['request'].query_params.get('include', '')
+        return mapping_depth_fields(include_fields, self.Meta.depth)
 
     def get_field_names(self, declared_fields, info):
-        request = self.context.get('request')
-        fields = super().get_field_names(declared_fields, info)
-        if request.method != 'GET' or request is None:
-            return fields
+        field_names = super().get_field_names(declared_fields, info)
 
-        view = self.context['view']
-        root_depth = view.serializer_class.Meta.depth
-        depth = root_depth - self.Meta.depth
-        prefix = getattr(self.Meta, 'prefix', '')
+        setattr(self, '_origin_fields', [f for f in field_names if f != self.url_field_name])
 
-        include = self.get_include_fields(request, depth, prefix)
-        exclude = self.get_exclude_fields(request, depth, prefix)
+        request = self.context.get('request', None)
+        if request is None or request.method != 'GET':
+            return field_names
+        root = self.root
+        if hasattr(root, 'child'):
+            root = root.child
+        fields_from_request = root.fields_from_request[self.Meta.depth]
 
-        if include:
-            fields = set(fields) & include
-        if exclude:
-            fields = set(fields) ^ exclude
-
-        return list(fields)
+        return fields_from_request or field_names
 
     def build_nested_field(self, field_name, relation_info, nested_depth):
-        _, field_kwargs = super().build_nested_field(field_name, relation_info, nested_depth)
-
-        class NestedSerializer(self.__class__):
-            class Meta:
+        class NestedSerializer(ModelDynamicFieldSerializer):
+            class Meta(self.Meta):
                 model = relation_info.related_model
                 depth = nested_depth - 1
                 fields = '__all__'
-                prefix = field_name
         field_class = NestedSerializer
+        field_kwargs = get_nested_relation_kwargs(relation_info)
         return field_class, field_kwargs

@@ -1,4 +1,6 @@
+from django.http.response import HttpResponseBase
 from rest_framework.utils import model_meta
+from rest_framework.response import Response
 
 
 def _get_fields_from_query_params(fields):
@@ -45,3 +47,38 @@ class DynamicFieldViewMix:
                 select_related_fields.remove(j)
 
         return select_related_fields
+
+
+def make_response(response, response_class=Response, **kwargs):
+    resp = response
+    status = None
+    headers = None
+    if isinstance(response, tuple):
+        if len(response) == 1:
+            resp = response
+        elif len(response) == 2:
+            resp, status_or_headers = response
+            if isinstance(status_or_headers, dict):
+                headers = status_or_headers
+        elif len(response) == 3:
+            if not isinstance(response[2], dict):
+                raise ValueError('headers must be a dict, but receive a %s' % type(response[2]))
+            resp, status, headers = response
+        else:
+            raise ValueError('if view returns a tuple, must be sure (data, [status, [headers]])')
+    if not isinstance(resp, HttpResponseBase):
+        resp = response_class(resp, **kwargs)
+    if status:
+        resp.status_code = status
+    if headers:
+        for k, v in headers.items():
+            resp[k] = v
+    return resp
+
+
+def wrap_finalize_response(wrapped):
+    def wrapper(self, request, response, *args, **kwargs):
+        resp = make_response(response)
+        return wrapped(self, request, resp, *args, **kwargs)
+    return wrapper
+
